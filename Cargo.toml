@@ -1,0 +1,20 @@
+[package]
+name = "tail-stack-events"
+version = "0.1.0"
+authors = ["Edward Makhlin <me@lain.im>"]
+edition = "2018"
+
+[dependencies]
+log = "0.4"
+fern = "0.5"
+chrono = "0.4"
+ctrlc = "3.1.1"
+human-panic = "1.0.1"
+rusoto_core = "0.37.0"
+rusoto_sts = "0.37.0"
+rusoto_ec2 = "0.37.0"
+rusoto_cloudformation = "0.37.0"
+rusoto_credential = "0.16.0"
+futures = "0.1.16"
+colored = "1.7"
+regex = "1"
