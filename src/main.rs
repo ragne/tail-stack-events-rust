@@ -12,7 +12,7 @@ use std::fmt;
 use std::time::{Duration, Instant};
 
 extern crate chrono;
-use chrono::{NaiveDate, NaiveDateTime};
+use chrono::NaiveDateTime;
 use std::ops::Deref;
 extern crate regex;
 use regex::Regex;
@@ -26,17 +26,9 @@ use rusoto_core::{HttpClient, Region};
 
 use rusoto_cloudformation::{
     CloudFormation, CloudFormationClient, DescribeStackEventsError, DescribeStackEventsInput,
-    DescribeStackEventsOutput, StackEvent,
+    StackEvent,
 };
-use rusoto_ec2::{
-    DescribeInstancesRequest, DescribeSpotInstanceRequestsRequest, Ec2, Ec2Client, Filter,
-};
-use rusoto_sts::AssumeRoleError;
-use rusoto_sts::{StsAssumeRoleSessionCredentialsProvider, StsClient};
-use std::error::Error;
 // ========== end of aws ======
-
-const EMPTY: &str = "";
 
 pub fn setup_logger(
     self_level: LevelFilter,
@@ -69,13 +61,13 @@ fn setup_aws_creds(
     auto_refreshing_provider.expect("cannot get a sts provider\\creds")
 }
 
-#[derive(Debug)]
 struct CFDescriber {
     last_event: Option<StackEvent>,
     last_api_call: Instant,
     follow: bool,
     die: bool,
     exit_code: u32,
+    client: CloudFormationClient,
 }
 
 struct CFStackEvent {
@@ -84,40 +76,43 @@ struct CFStackEvent {
 
 impl std::fmt::Display for CFStackEvent {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let mut status = self.inner.resource_status.clone().unwrap_or(String::new());
         let mut msg;
-        if status.contains("FAILED") {
-            status = "✗ ".to_owned() + &status;
-            msg = status.red();
-        } else if status.contains("COMPLETE") {
-            status = "✓ ".to_owned() + &status;
-            msg = status.green();
+        if let Some(mut status) = self.inner.resource_status.clone() {
+            if status.contains("FAILED") {
+                status = "✗ ".to_owned() + &status;
+                msg = status.red();
+            } else if status.contains("COMPLETE") {
+                status = "✓ ".to_owned() + &status;
+                msg = status.green();
+            } else {
+                status = "⌛ ".to_owned() + &status;
+                msg = status.blue();
+            }
         } else {
-            status = "⌛ ".to_owned() + &status;
-            msg = status.blue();
-        };
+            msg = "⚠️ Not defined (probably a bug)!".to_owned().red();
+            warn!("Got non-typical event without resource_status: {:#?}", self.inner);
+        }
 
         let date = NaiveDateTime::parse_from_str(&self.inner.timestamp, "%+").unwrap();
+        let logical_resource_id =
+            self.inner
+                .logical_resource_id
+                .clone()
+                .unwrap_or_else(|| "".to_owned());
+        let resource_type = self.inner.resource_type.clone().unwrap_or_else(|| "".to_owned());
+        let resource_status_reason =
+            self.inner
+                .resource_status_reason
+                .clone()
+                .unwrap_or_else(|| "".to_owned());
 
         f.write_fmt(format_args!(
             "{:<15.15} {:<25.25} {:<25.25} {:<25.25} {:<50}",
             date.format("%H:%M:%S"),
-            self.inner
-                .logical_resource_id
-                .clone()
-                .expect("cannot get logical_resource_id")
-                .bold(),
-            self.inner
-                .resource_type
-                .clone()
-                .unwrap_or("".to_owned())
-                .replace("AWS::", "")
-                .cyan(),
+            logical_resource_id.bold(),
+            resource_type.replace("AWS::", "").cyan(),
             msg,
-            self.inner
-                .resource_status_reason
-                .clone()
-                .unwrap_or("".to_owned())
+            resource_status_reason
         ))
     }
 }
@@ -137,27 +132,28 @@ impl From<StackEvent> for CFStackEvent {
 }
 
 impl CFDescriber {
-    fn new(follow: bool, die: bool) -> Self {
+    fn new(region: Region, role_arn: Option<String>, follow: bool, die: bool) -> Self {
+        let provider = setup_aws_creds(region.clone(), role_arn);
+        let client = HttpClient::new().expect("cannot get a client");
+        let cf = CloudFormationClient::new_with(client, provider, region);
+
         Self {
             last_event: None,
             last_api_call: Instant::now(),
-            follow: follow,
-            die: die,
+            follow,
+            die,
             exit_code: 0,
+            client: cf,
         }
     }
 
     fn get_recent_events(&mut self, stack_name: &str) -> Result<Vec<CFStackEvent>, String> {
-        let provider = setup_aws_creds(Region::EuWest1, None);
-        let client = HttpClient::new().expect("cannot get a client");
-        let cf = CloudFormationClient::new_with(client, provider, Region::EuWest1);
-
         let cf_desc_input = DescribeStackEventsInput {
             stack_name: Some(stack_name.to_owned()),
             ..Default::default()
         };
 
-        let evts = cf.describe_stack_events(cf_desc_input);
+        let evts = self.client.describe_stack_events(cf_desc_input);
         let evts = evts
             .sync()
             .map(|out| out.stack_events)
@@ -186,7 +182,7 @@ impl CFDescriber {
             new_evts = &evts[0..10];
         };
 
-        if new_evts.len() > 0 {
+        if !new_evts.is_empty() {
             debug!("about to set last_event to: {:?}!", new_evts[0].clone());
             self.last_event = Some(new_evts[0].clone());
         }
@@ -204,20 +200,19 @@ impl CFDescriber {
             return true;
         }
         if self.die {
-            if self.last_event.is_some() {
-                let ev = self.last_event.clone().unwrap();
-                if ev.resource_type.unwrap_or("".to_owned()) == "AWS::CloudFormation::Stack"
-                    && ev.logical_resource_id.unwrap_or("".to_owned()) == stack_name
+            if let Some(last_event) = self.last_event.clone() {
+                if last_event.resource_type.unwrap_or_else(|| "".to_owned()) == "AWS::CloudFormation::Stack"
+                    && last_event.logical_resource_id.unwrap_or_else(|| "".to_owned()) == stack_name
                 {
                     // emulate lookahead
                     // (?<!ROLLBACK)
-                    if let Some(resource_status) = &ev.resource_status {
+                    if let Some(resource_status) = &last_event.resource_status {
                         let is_success = !resource_status.contains("ROLLBACK")
-                            && Regex::new(r"_COMPLETE$").unwrap().is_match(resource_status);
+                            && resource_status.ends_with("_COMPLETE");
                         let is_failure =
                             Regex::new(r"(?:ROLLBACK_COMPLETE$|UPDATE_ROLLBACK_COMPLETE$|FAILED)")
                                 .unwrap()
-                                .is_match(&ev.resource_status.unwrap_or("".to_owned()));
+                                .is_match(&last_event.resource_status.unwrap_or_else(|| "".to_owned()));
                         if !is_success {
                             self.exit_code = 1
                         } else {
@@ -272,27 +267,10 @@ fn main() {
     //setup_panic!();
     setup_logger(LevelFilter::Warn, LevelFilter::Warn)
         .expect("Cannot setup logger. Shouldn't be possible in most cases");
-    let provider = setup_aws_creds(Region::EuWest1, None);
-    let client = HttpClient::new().expect("cannot get a client");
 
-    let mut cf = CFDescriber::new(false, true);
+    let mut cf = CFDescriber::new(Region::UsEast1, None, false, true);
     let args: Vec<String> = env::args().collect();
-    let stack_name: &str;
-    if args.len() > 1 {
-        stack_name = &args[1];
-    } else {
-        stack_name = "cf-test";
-    }
+    let stack_name = if args.len() > 1 { &args[1] } else { "cf-test" };
     println!("{:?}", args);
     cf.print_events(stack_name);
-    // let evts = cf.get_recent_events("cf-test");
-
-    // match evts {
-    //     Err(e) => error!("error: {}", e),
-    //     Ok(data) => {
-    //         for event in data.iter() {
-    //             println!("{}", event);
-    //         }
-    //     }
-    // };
 }

@@ -1,7 +1,6 @@
-use futures::future::{result, FutureResult};
-use futures::{Async, Future, Poll};
+use futures::{Future, Poll};
 use rusoto_core::{
-    credential::{AutoRefreshingProvider, ChainProvider, ProvideAwsCredentials},
+    credential::{ChainProvider, ProvideAwsCredentials},
     region::Region,
     request::HttpClient,
 };
