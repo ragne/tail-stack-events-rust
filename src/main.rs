@@ -17,6 +17,10 @@ use std::ops::Deref;
 extern crate regex;
 use regex::Regex;
 use std::cmp;
+
+#[macro_use]
+extern crate clap;
+use clap::{App, Arg};
 // ======== aws ========
 extern crate rusoto_core;
 extern crate rusoto_ec2;
@@ -29,6 +33,10 @@ use rusoto_cloudformation::{
     StackEvent,
 };
 // ========== end of aws ======
+use std::error::Error;
+use std::str::FromStr;
+
+const MAX_TRIES: u8 = 10;
 
 pub fn setup_logger(
     self_level: LevelFilter,
@@ -52,6 +60,81 @@ pub fn setup_logger(
     Ok(())
 }
 
+struct Config {
+    region: rusoto_core::Region,
+    stack_name: String,
+    debug: bool,
+    role_name: Option<String>,
+}
+
+fn get_config_from_args() -> Result<Config, String> {
+    let matches = App::new("tail-stack-events")
+        .version(crate_version!())
+        .about("Tails CloudFormation stack events")
+        .arg(
+            Arg::with_name("region")
+                .short("r")
+                .long("region")
+                .value_name("REGION")
+                .help("Sets a region to use")
+                .takes_value(true)
+                .required(true),
+        )
+        .arg(
+            Arg::with_name("stack")
+                .help("Sets a stack name to watch for")
+                .takes_value(true)
+                .required(true),
+        )
+        .arg(
+            Arg::with_name("debug")
+                .short("d")
+                .help("Turn debugging logging on"),
+        )
+        .arg(
+            Arg::with_name("role_arn")
+                .long("role_arn")
+                .value_name("ASSUME_ROLE_ARN")
+                .help("Sets an ARN for assume-role to use")
+                .takes_value(true),
+        )
+        .get_matches();
+    let region;
+    let debug;
+    let stack_name;
+    let role_name;
+    if matches.is_present("region") {
+        region = rusoto_core::Region::from_str(matches.value_of("region").unwrap())
+            .map_err(|e| format!("{:#?}", e))?;
+    } else {
+        return Err("no region name was given".to_owned());
+    };;
+
+    if matches.is_present("stack") {
+        stack_name = matches.value_of("stack").unwrap().to_owned();
+    } else {
+        return Err("no stack name was given".to_owned());
+    };
+    if matches.is_present("role_arn") {
+        role_name = Some(matches.value_of("role_arn").unwrap().to_owned());
+    } else {
+        role_name = None
+    };
+
+    if matches.is_present("debug") {
+        debug = true
+    } else {
+        debug = false
+    };
+
+    Ok(Config {
+        region,
+        stack_name,
+        debug,
+        role_name,
+    })
+}
+
 fn setup_aws_creds(
     region: Region,
     role_name: Option<String>,
@@ -68,6 +151,8 @@ struct CFDescriber {
     die: bool,
     exit_code: u32,
     client: CloudFormationClient,
+    api_timeout_max_ms: u128,
+    failed_attempts: u8,
 }
 
 struct CFStackEvent {
@@ -90,24 +175,32 @@ impl std::fmt::Display for CFStackEvent {
             }
         } else {
             msg = "⚠️ Not defined (probably a bug)!".to_owned().red();
-            warn!("Got non-typical event without resource_status: {:#?}", self.inner);
+            warn!(
+                "Got non-typical event without resource_status: {:#?}",
+                self.inner
+            );
         }
 
+        // pretty reasonable to always expect time in request (filed isn't optional)
         let date = NaiveDateTime::parse_from_str(&self.inner.timestamp, "%+").unwrap();
-        let logical_resource_id =
-            self.inner
-                .logical_resource_id
-                .clone()
-                .unwrap_or_else(|| "".to_owned());
-        let resource_type = self.inner.resource_type.clone().unwrap_or_else(|| "".to_owned());
-        let resource_status_reason =
-            self.inner
-                .resource_status_reason
-                .clone()
-                .unwrap_or_else(|| "".to_owned());
+        let logical_resource_id = self
+            .inner
+            .logical_resource_id
+            .clone()
+            .unwrap_or_else(|| "".to_owned());
+        let resource_type = self
+            .inner
+            .resource_type
+            .clone()
+            .unwrap_or_else(|| "".to_owned());
+        let resource_status_reason = self
+            .inner
+            .resource_status_reason
+            .clone()
+            .unwrap_or_else(|| "".to_owned());
 
         f.write_fmt(format_args!(
-            "{:<15.15} {:<25.25} {:<25.25} {:<25.25} {:<50}",
+            "{:<15.15} {:<25.25} {:<35.35} {:<25.25} {:<50}",
             date.format("%H:%M:%S"),
             logical_resource_id.bold(),
             resource_type.replace("AWS::", "").cyan(),
@@ -144,23 +237,26 @@ impl CFDescriber {
             die,
             exit_code: 0,
             client: cf,
+            api_timeout_max_ms: 3000, // 3 seconds
+            failed_attempts: 0,
         }
     }
 
-    fn get_recent_events(&mut self, stack_name: &str) -> Result<Vec<CFStackEvent>, String> {
+    fn get_recent_events(
+        &mut self,
+        stack_name: &str,
+    ) -> Result<Vec<CFStackEvent>, rusoto_core::RusotoError<DescribeStackEventsError>> {
         let cf_desc_input = DescribeStackEventsInput {
             stack_name: Some(stack_name.to_owned()),
             ..Default::default()
         };
 
-        let evts = self.client.describe_stack_events(cf_desc_input);
-        let evts = evts
-            .sync()
-            .map(|out| out.stack_events)
-            .map_err(|e| format!("{:?}", e))?;
-
-        let evts = evts.unwrap();
         self.last_api_call = Instant::now();
+        let evts = self.client.describe_stack_events(cf_desc_input);
+        let evts = evts.sync().map(|out| out.stack_events)?;
+
+        // guaranteed to succeed, otherwise should bail out before
+        let evts = evts.unwrap();
         let new_evts;
         if self.last_event.is_some() {
             let last_event_idx = evts.iter().position(|el| {
@@ -172,8 +268,9 @@ impl CFDescriber {
 
                 event_id == el.event_id
             });
-            //.enumerate().filter(|(i, el)| ).nth(0).map(|(i, el)| i as i32).unwrap_or(-1);
+
             if last_event_idx.is_some() {
+                // can be rewritten as looooong if let Some(x) ... just to get rid of unwrap
                 new_evts = &evts[0..last_event_idx.unwrap()];
             } else {
                 new_evts = &evts[0..evts.len()];
@@ -201,8 +298,12 @@ impl CFDescriber {
         }
         if self.die {
             if let Some(last_event) = self.last_event.clone() {
-                if last_event.resource_type.unwrap_or_else(|| "".to_owned()) == "AWS::CloudFormation::Stack"
-                    && last_event.logical_resource_id.unwrap_or_else(|| "".to_owned()) == stack_name
+                if last_event.resource_type.unwrap_or_else(|| "".to_owned())
+                    == "AWS::CloudFormation::Stack"
+                    && last_event
+                        .logical_resource_id
+                        .unwrap_or_else(|| "".to_owned())
+                        == stack_name
                 {
                     // emulate lookahead
                     // (?<!ROLLBACK)
@@ -212,7 +313,9 @@ impl CFDescriber {
                         let is_failure =
                             Regex::new(r"(?:ROLLBACK_COMPLETE$|UPDATE_ROLLBACK_COMPLETE$|FAILED)")
                                 .unwrap()
-                                .is_match(&last_event.resource_status.unwrap_or_else(|| "".to_owned()));
+                                .is_match(
+                                    &last_event.resource_status.unwrap_or_else(|| "".to_owned()),
+                                );
                         if !is_success {
                             self.exit_code = 1
                         } else {
@@ -240,37 +343,54 @@ impl CFDescriber {
                     }
                 }
                 Err(e) => {
-                    error!("Error calling get_recent_events! {}", e);
-                    // todo: retry
-                    std::process::exit(2);
+                    match e {
+                        rusoto_core::RusotoError::Unknown(ref cause) => {
+                            if cause.status == 403 {
+                                debug!("Error calling get_recent_events!\nStatus code: {}\nBody: {}\nHeaders: {:#?}",
+                                    cause.status, cause.body_as_str(), cause.headers);
+                                error!("Error calling get_recent_events! Got 403 Forbidden! Check your credentials!");
+                            }
+                        }
+                        _ => {
+                            error!("Error calling get_recent_events! {:#?} Retrying...", e);
+                            if self.failed_attempts >= MAX_TRIES {
+                                std::process::exit(2);
+                            } else {
+                                self.failed_attempts += 1;
+                                // naively increase the timeout
+                                self.api_timeout_max_ms += 500; // half of second each try
+                                                                // in the end it will take longer but allow to avoil possible ramming\rate-limiting from AWS
+                            }
+                        }
+                    };
                 }
             };
 
-            // @TODO: fixme
-            let last_api_call_sec = self.last_api_call.elapsed().as_secs();
-            let wait_time;
-            if last_api_call_sec < 3 {
-                wait_time = cmp::max(1, 3 - last_api_call_sec);
+            let last_api_call_sec = self.last_api_call.elapsed().as_millis();
+            let wait_time = if last_api_call_sec < self.api_timeout_max_ms {
+                cmp::max(100, self.api_timeout_max_ms - last_api_call_sec)
             } else {
-                wait_time = 3;
+                self.api_timeout_max_ms
             };
 
             use std::thread;
-            thread::sleep(Duration::from_secs(wait_time));
+            thread::sleep(Duration::from_millis(wait_time as u64));
         }
     }
 }
 
-use std::env;
+fn main() -> Result<(), String> {
+    setup_panic!();
+    let config = get_config_from_args()?;
+    if config.debug {
+        setup_logger(LevelFilter::Debug, LevelFilter::Debug)
+            .expect("Cannot setup logger. Shouldn't be possible in most cases");
+    } else {
+        setup_logger(LevelFilter::Warn, LevelFilter::Warn)
+            .expect("Cannot setup logger. Shouldn't be possible in most cases");
+    };
 
-fn main() {
-    //setup_panic!();
-    setup_logger(LevelFilter::Warn, LevelFilter::Warn)
-        .expect("Cannot setup logger. Shouldn't be possible in most cases");
-
-    let mut cf = CFDescriber::new(Region::UsEast1, None, false, true);
-    let args: Vec<String> = env::args().collect();
-    let stack_name = if args.len() > 1 { &args[1] } else { "cf-test" };
-    println!("{:?}", args);
-    cf.print_events(stack_name);
+    let mut cf = CFDescriber::new(config.region, config.role_name, false, true);
+    cf.print_events(&config.stack_name);
+    Ok(())
 }

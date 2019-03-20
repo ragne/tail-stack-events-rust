@@ -10,11 +10,12 @@ fern = "0.5"
 chrono = "0.4"
 ctrlc = "3.1.1"
 human-panic = "1.0.1"
-rusoto_core = "0.37.0"
-rusoto_sts = "0.37.0"
-rusoto_ec2 = "0.37.0"
-rusoto_cloudformation = "0.37.0"
-rusoto_credential = "0.16.0"
+rusoto_core = {git = "https://github.com/alex-berger/rusoto", branch = "master" }
+rusoto_sts = {git = "https://github.com/alex-berger/rusoto", branch = "master" }
+rusoto_ec2 = {git = "https://github.com/alex-berger/rusoto", branch = "master" }
+rusoto_cloudformation = {git = "https://github.com/alex-berger/rusoto", branch = "master" }
+rusoto_credential = {git = "https://github.com/alex-berger/rusoto", branch = "master" }
 futures = "0.1.16"
 colored = "1.7"
 regex = "1"
+clap = "2.32.0"
