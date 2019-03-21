@@ -1,13 +1,13 @@
 #[macro_use]
 extern crate human_panic;
-use fern;
 #[macro_use]
 extern crate log;
-use log::LevelFilter;
 use std::default::Default;
 mod credentials;
+mod logging;
 use colored::*;
-use credentials::CustomCredentialProvider;
+use credentials::setup_aws_creds;
+use logging::setup_logger;
 use std::fmt;
 use std::time::{Duration, Instant};
 
@@ -30,7 +30,7 @@ use rusoto_core::{HttpClient, Region};
 
 use rusoto_cloudformation::{
     CloudFormation, CloudFormationClient, DescribeStackEventsError, DescribeStackEventsInput,
-    StackEvent,
+    DescribeStacksInput, StackEvent,
 };
 // ========== end of aws ======
 use std::error::Error;
@@ -38,34 +38,14 @@ use std::str::FromStr;
 
 const MAX_TRIES: u8 = 10;
 
-pub fn setup_logger(
-    self_level: LevelFilter,
-    default_level: LevelFilter,
-) -> Result<(), fern::InitError> {
-    fern::Dispatch::new()
-        .format(|out, message, record| {
-            out.finish(format_args!(
-                "{}[{}][{}] {}",
-                chrono::Local::now().format("[%Y-%m-%d %H:%M:%S]"),
-                record.target(),
-                record.level(),
-                message
-            ))
-        })
-        .level(default_level)
-        .level_for("tail-stack-events", self_level)
-        .chain(std::io::stdout())
-        .chain(fern::log_file("output.log")?)
-        .apply()?;
-    Ok(())
-}
-
 struct Config {
-    region: rusoto_core::Region,
+    region: Region,
     stack_name: String,
-    debug: bool,
+    debug: u8,
     role_name: Option<String>,
     profile_name: Option<String>,
+    follow: bool,
+    num_events: u8,
 }
 
 fn get_config_from_args() -> Result<Config, String> {
@@ -90,7 +70,8 @@ fn get_config_from_args() -> Result<Config, String> {
         .arg(
             Arg::with_name("debug")
                 .short("d")
-                .help("Turn debugging logging on"),
+                .multiple(true)
+                .help("Turn debugging logging on. Multiple occurences enable console debug. First one will write to separate logfile"),
         )
         .arg(
             Arg::with_name("role_arn")
@@ -101,11 +82,26 @@ fn get_config_from_args() -> Result<Config, String> {
         )
         .arg(
             Arg::with_name("profile")
-            .short("p")
-            .long("profile")
+                .short("p")
+                .long("profile")
+                .takes_value(true)
+                .help("Sets an AWS-cli profile from ~/.aws/config")
+                .value_name("AWS_PROFILE"),
+        ).
+        arg(
+            Arg::with_name("follow")
+            .short("f")
+            .multiple(false)
+            .takes_value(false)
+            .help("Follow stack events till success\\failure of the whole stack")
+        ).
+        arg(
+            Arg::with_name("num_events")
+            .help("Number of events to pull in one go (max: 100)")
+            .value_name("NUMBER_OF_EVENTS")
+            .default_value("10")
             .takes_value(true)
-            .help("Sets an AWS-cli profile from ~/.aws/config")
-            .value_name("AWS_PROFILE")
+            .short("n")
         )
         .get_matches();
     let region;
@@ -113,13 +109,15 @@ fn get_config_from_args() -> Result<Config, String> {
     let stack_name;
     let role_name;
     let profile_name;
+    let follow;
+    let num_events: u8;
 
     if matches.is_present("region") {
-        region = rusoto_core::Region::from_str(matches.value_of("region").unwrap())
+        region = Region::from_str(matches.value_of("region").unwrap())
             .map_err(|e| format!("{:#?}", e))?;
     } else {
         return Err("no region name was given".to_owned());
-    };;
+    };
 
     if matches.is_present("stack") {
         stack_name = matches.value_of("stack").unwrap().to_owned();
@@ -138,40 +136,32 @@ fn get_config_from_args() -> Result<Config, String> {
         profile_name = None
     };
 
-    if matches.is_present("debug") {
-        debug = true
-    } else {
-        debug = false
-    };
+    debug = matches.occurrences_of("debug") as u8;
+    follow = matches.is_present("follow");
+    num_events = cmp::min(100, value_t!(matches, "num_events", u8).unwrap_or(10));
 
     Ok(Config {
         region,
         stack_name,
         debug,
         role_name,
-        profile_name
+        profile_name,
+        follow,
+        num_events,
     })
-}
-
-fn setup_aws_creds(
-    region: Region,
-    role_name: Option<String>,
-    profile_name: Option<String>
-) -> rusoto_credential::AutoRefreshingProvider<CustomCredentialProvider> {
-    let provider = CustomCredentialProvider::new(role_name, region, profile_name);
-    let auto_refreshing_provider = rusoto_credential::AutoRefreshingProvider::new(provider);
-    auto_refreshing_provider.expect("cannot get a sts provider\\creds")
 }
 
 struct CFDescriber {
     last_event: Option<StackEvent>,
     last_api_call: Instant,
     follow: bool,
-    die: bool,
     exit_code: u32,
     client: CloudFormationClient,
     api_timeout_max_ms: u128,
     failed_attempts: u8,
+    num_events: u8,
+    // todo: get rid of me
+    first_call: bool,
 }
 
 struct CFStackEvent {
@@ -244,20 +234,26 @@ impl From<StackEvent> for CFStackEvent {
 }
 
 impl CFDescriber {
-    fn new(config: &Config, follow: bool, die: bool) -> Self {
-        let provider = setup_aws_creds(config.region.clone(), config.role_name.clone(), config.profile_name.clone());
+    fn new(config: &Config) -> Self {
+        let provider = setup_aws_creds(
+            config.region.clone(),
+            config.role_name.clone(),
+            config.profile_name.clone(),
+        );
         let client = HttpClient::new().expect("cannot get a client");
         let cf = CloudFormationClient::new_with(client, provider, config.region.clone());
 
         Self {
             last_event: None,
             last_api_call: Instant::now(),
-            follow,
-            die,
+            follow: config.follow,
             exit_code: 0,
             client: cf,
             api_timeout_max_ms: 3000, // 3 seconds
             failed_attempts: 0,
+            num_events: config.num_events,
+            // todo: figure out
+            first_call: true,
         }
     }
 
@@ -295,7 +291,8 @@ impl CFDescriber {
                 new_evts = &evts[0..evts.len()];
             };
         } else {
-            new_evts = &evts[0..10];
+            println!("self num: {}", self.num_events as usize);
+            new_evts = &evts[0..self.num_events as usize];
         };
 
         if !new_evts.is_empty() {
@@ -313,9 +310,6 @@ impl CFDescriber {
 
     fn should_keep_tailing(&mut self, stack_name: &str) -> bool {
         if self.follow {
-            return true;
-        }
-        if self.die {
             if let Some(last_event) = self.last_event.clone() {
                 if last_event.resource_type.unwrap_or_else(|| "".to_owned())
                     == "AWS::CloudFormation::Stack"
@@ -364,8 +358,21 @@ impl CFDescriber {
         }
     }
 
+    fn is_stack_exists(&self, stack_name: &str) -> bool {
+        let input = DescribeStacksInput {
+            stack_name: Some(stack_name.to_owned()),
+            ..Default::default()
+        };
+        self.client.describe_stacks(input).sync().is_ok()
+    }
+
     fn print_events(&mut self, stack_name: &str) {
-        while self.should_keep_tailing(stack_name) {
+        if !self.is_stack_exists(stack_name) {
+            error!("Stack with name {} doesn't exist!", stack_name);
+            std::process::exit(1);
+        }
+        while self.should_keep_tailing(stack_name) || self.first_call {
+            self.first_call = false;
             match self.get_recent_events(stack_name) {
                 Ok(evts) => {
                     for event in evts.iter() {
@@ -415,15 +422,10 @@ impl CFDescriber {
 fn main() -> Result<(), String> {
     setup_panic!();
     let config = get_config_from_args()?;
-    if config.debug {
-        setup_logger(LevelFilter::Debug, LevelFilter::Debug)
-            .expect("Cannot setup logger. Shouldn't be possible in most cases");
-    } else {
-        setup_logger(LevelFilter::Warn, LevelFilter::Warn)
-            .expect("Cannot setup logger. Shouldn't be possible in most cases");
-    };
 
-    let mut cf = CFDescriber::new(&config, false, true);
+    setup_logger(&config).expect("Cannot setup logger. Shouldn't be possible in most cases");
+
+    let mut cf = CFDescriber::new(&config);
     cf.print_events(&config.stack_name);
     Ok(())
 }

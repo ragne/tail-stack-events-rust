@@ -33,7 +33,8 @@ impl ProvideAwsCredentials for CustomCredentialProvider {
     fn credentials(&self) -> Self::Future {
         let mut credentials;
         if self.profile_name.is_some() {
-            let mut profile_provider = ProfileProvider::new().expect("Cannot create profile_provider");
+            let mut profile_provider =
+                ProfileProvider::new().expect("Cannot create profile_provider");
             profile_provider.set_profile(self.profile_name.clone().unwrap());
             credentials = ChainProvider::with_profile_provider(profile_provider);
         } else {
@@ -74,4 +75,14 @@ impl CustomCredentialProvider {
             profile_name,
         }
     }
+}
+
+pub(crate) fn setup_aws_creds(
+    region: Region,
+    role_name: Option<String>,
+    profile_name: Option<String>,
+) -> rusoto_credential::AutoRefreshingProvider<CustomCredentialProvider> {
+    let provider = CustomCredentialProvider::new(role_name, region, profile_name);
+    let auto_refreshing_provider = rusoto_credential::AutoRefreshingProvider::new(provider);
+    auto_refreshing_provider.expect("cannot get a sts provider\\creds")
 }
