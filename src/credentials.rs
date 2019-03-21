@@ -4,13 +4,14 @@ use rusoto_core::{
     region::Region,
     request::HttpClient,
 };
-use rusoto_credential::{AwsCredentials, CredentialsError};
+use rusoto_credential::{AwsCredentials, CredentialsError, ProfileProvider};
 use rusoto_sts::{StsAssumeRoleSessionCredentialsProvider, StsClient};
 use std::time::Duration;
 
 pub(crate) struct CustomCredentialProvider {
     role_arn: Option<String>,
     region: Region,
+    profile_name: Option<String>,
 }
 
 pub struct CustomCredentialProviderFuture {
@@ -30,8 +31,15 @@ impl ProvideAwsCredentials for CustomCredentialProvider {
     type Future = CustomCredentialProviderFuture;
 
     fn credentials(&self) -> Self::Future {
-        //write your logic here for accessing either chainprovider or stsprovider calling credentials()
-        let mut credentials = ChainProvider::new();
+        let mut credentials;
+        if self.profile_name.is_some() {
+            let mut profile_provider = ProfileProvider::new().expect("Cannot create profile_provider");
+            profile_provider.set_profile(self.profile_name.clone().unwrap());
+            credentials = ChainProvider::with_profile_provider(profile_provider);
+        } else {
+            credentials = ChainProvider::new();
+        };
+
         credentials.set_timeout(Duration::from_secs(10));
 
         if let Some(ref role_arn) = self.role_arn {
@@ -59,7 +67,11 @@ impl ProvideAwsCredentials for CustomCredentialProvider {
 }
 
 impl CustomCredentialProvider {
-    pub fn new(role_arn: Option<String>, region: Region) -> Self {
-        Self { role_arn, region }
+    pub fn new(role_arn: Option<String>, region: Region, profile_name: Option<String>) -> Self {
+        Self {
+            role_arn,
+            region,
+            profile_name,
+        }
     }
 }

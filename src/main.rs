@@ -65,6 +65,7 @@ struct Config {
     stack_name: String,
     debug: bool,
     role_name: Option<String>,
+    profile_name: Option<String>,
 }
 
 fn get_config_from_args() -> Result<Config, String> {
@@ -98,11 +99,21 @@ fn get_config_from_args() -> Result<Config, String> {
                 .help("Sets an ARN for assume-role to use")
                 .takes_value(true),
         )
+        .arg(
+            Arg::with_name("profile")
+            .short("p")
+            .long("profile")
+            .takes_value(true)
+            .help("Sets an AWS-cli profile from ~/.aws/config")
+            .value_name("AWS_PROFILE")
+        )
         .get_matches();
     let region;
     let debug;
     let stack_name;
     let role_name;
+    let profile_name;
+
     if matches.is_present("region") {
         region = rusoto_core::Region::from_str(matches.value_of("region").unwrap())
             .map_err(|e| format!("{:#?}", e))?;
@@ -121,6 +132,12 @@ fn get_config_from_args() -> Result<Config, String> {
         role_name = None
     };
 
+    if matches.is_present("profile") {
+        profile_name = Some(matches.value_of("profile").unwrap().to_owned());
+    } else {
+        profile_name = None
+    };
+
     if matches.is_present("debug") {
         debug = true
     } else {
@@ -132,14 +149,16 @@ fn get_config_from_args() -> Result<Config, String> {
         stack_name,
         debug,
         role_name,
+        profile_name
     })
 }
 
 fn setup_aws_creds(
     region: Region,
     role_name: Option<String>,
+    profile_name: Option<String>
 ) -> rusoto_credential::AutoRefreshingProvider<CustomCredentialProvider> {
-    let provider = CustomCredentialProvider::new(role_name, region);
+    let provider = CustomCredentialProvider::new(role_name, region, profile_name);
     let auto_refreshing_provider = rusoto_credential::AutoRefreshingProvider::new(provider);
     auto_refreshing_provider.expect("cannot get a sts provider\\creds")
 }
@@ -225,10 +244,10 @@ impl From<StackEvent> for CFStackEvent {
 }
 
 impl CFDescriber {
-    fn new(region: Region, role_arn: Option<String>, follow: bool, die: bool) -> Self {
-        let provider = setup_aws_creds(region.clone(), role_arn);
+    fn new(config: &Config, follow: bool, die: bool) -> Self {
+        let provider = setup_aws_creds(config.region.clone(), config.role_name.clone(), config.profile_name.clone());
         let client = HttpClient::new().expect("cannot get a client");
-        let cf = CloudFormationClient::new_with(client, provider, region);
+        let cf = CloudFormationClient::new_with(client, provider, config.region.clone());
 
         Self {
             last_event: None,
@@ -334,6 +353,17 @@ impl CFDescriber {
         false
     }
 
+    fn handle_retry(&mut self) {
+        if self.failed_attempts >= MAX_TRIES {
+            std::process::exit(2);
+        } else {
+            self.failed_attempts += 1;
+            // naively increase the timeout
+            self.api_timeout_max_ms += 500; // half of second each try
+                                            // in the end it will take longer but allow to avoil possible ramming\rate-limiting from AWS
+        }
+    }
+
     fn print_events(&mut self, stack_name: &str) {
         while self.should_keep_tailing(stack_name) {
             match self.get_recent_events(stack_name) {
@@ -346,21 +376,24 @@ impl CFDescriber {
                     match e {
                         rusoto_core::RusotoError::Unknown(ref cause) => {
                             if cause.status == 403 {
+                                // Mostly caused by credentials in my testing, somehow didn't end up in Credentials variant of enum
                                 debug!("Error calling get_recent_events!\nStatus code: {}\nBody: {}\nHeaders: {:#?}",
                                     cause.status, cause.body_as_str(), cause.headers);
                                 error!("Error calling get_recent_events! Got 403 Forbidden! Check your credentials!");
+                                std::process::exit(2);
+                            } else {
+                                error!("Error calling get_recent_events!\nStatus code: {}\nBody: {}\nHeaders: {:#?}",
+                                    cause.status, cause.body_as_str(), cause.headers);
+                                self.handle_retry();
                             }
+                        }
+                        rusoto_core::RusotoError::Credentials(ref error) => {
+                            error!("Error with provided credentials! {}", error.description());
+                            std::process::exit(2);
                         }
                         _ => {
                             error!("Error calling get_recent_events! {:#?} Retrying...", e);
-                            if self.failed_attempts >= MAX_TRIES {
-                                std::process::exit(2);
-                            } else {
-                                self.failed_attempts += 1;
-                                // naively increase the timeout
-                                self.api_timeout_max_ms += 500; // half of second each try
-                                                                // in the end it will take longer but allow to avoil possible ramming\rate-limiting from AWS
-                            }
+                            self.handle_retry();
                         }
                     };
                 }
@@ -390,7 +423,7 @@ fn main() -> Result<(), String> {
             .expect("Cannot setup logger. Shouldn't be possible in most cases");
     };
 
-    let mut cf = CFDescriber::new(config.region, config.role_name, false, true);
+    let mut cf = CFDescriber::new(&config, false, true);
     cf.print_events(&config.stack_name);
     Ok(())
 }
