@@ -35,6 +35,7 @@ use rusoto_cloudformation::{
 // ========== end of aws ======
 use std::error::Error;
 use std::str::FromStr;
+use std::thread;
 
 const MAX_TRIES: u8 = 10;
 
@@ -46,6 +47,7 @@ struct Config {
     profile_name: Option<String>,
     follow: bool,
     num_events: u8,
+    timeout: u128,
 }
 
 fn get_config_from_args() -> Result<Config, String> {
@@ -103,6 +105,14 @@ fn get_config_from_args() -> Result<Config, String> {
             .takes_value(true)
             .short("n")
         )
+        .arg(
+            Arg::with_name("timeout")
+            .short("t")
+            .help("Number of seconds to wait between subsequental calls")
+            .default_value("10")
+            .takes_value(true)
+            .value_name("TIMEOUT")
+        )
         .get_matches();
     let region;
     let debug;
@@ -111,6 +121,7 @@ fn get_config_from_args() -> Result<Config, String> {
     let profile_name;
     let follow;
     let num_events: u8;
+    let timeout: u128;
 
     if matches.is_present("region") {
         region = Region::from_str(matches.value_of("region").unwrap())
@@ -140,6 +151,12 @@ fn get_config_from_args() -> Result<Config, String> {
     follow = matches.is_present("follow");
     num_events = cmp::min(100, value_t!(matches, "num_events", u8).unwrap_or(10));
 
+    // from cmd-args we got seconds, but internally we use ms
+    timeout = cmp::max(
+        1000,
+        value_t!(matches, "timeout", u128).unwrap_or(10) * 1000,
+    );
+
     Ok(Config {
         region,
         stack_name,
@@ -148,6 +165,7 @@ fn get_config_from_args() -> Result<Config, String> {
         profile_name,
         follow,
         num_events,
+        timeout,
     })
 }
 
@@ -162,6 +180,7 @@ struct CFDescriber {
     num_events: u8,
     // todo: get rid of me
     first_call: bool,
+    should_retry: bool,
 }
 
 struct CFStackEvent {
@@ -210,7 +229,7 @@ impl std::fmt::Display for CFStackEvent {
 
         f.write_fmt(format_args!(
             "{:<15.15} {:<25.25} {:<35.35} {:<25.25} {:<50}",
-            date.format("%H:%M:%S"),
+            date.format("%d %b %H:%M:%S"),
             logical_resource_id.bold(),
             resource_type.replace("AWS::", "").cyan(),
             msg,
@@ -249,11 +268,12 @@ impl CFDescriber {
             follow: config.follow,
             exit_code: 0,
             client: cf,
-            api_timeout_max_ms: 3000, // 3 seconds
+            api_timeout_max_ms: config.timeout, // 10 seconds
             failed_attempts: 0,
             num_events: config.num_events,
             // todo: figure out
             first_call: true,
+            should_retry: false,
         }
     }
 
@@ -291,7 +311,6 @@ impl CFDescriber {
                 new_evts = &evts[0..evts.len()];
             };
         } else {
-            println!("self num: {}", self.num_events as usize);
             new_evts = &evts[0..self.num_events as usize];
         };
 
@@ -352,18 +371,72 @@ impl CFDescriber {
             std::process::exit(2);
         } else {
             self.failed_attempts += 1;
-            // naively increase the timeout
-            self.api_timeout_max_ms += 500; // half of second each try
-                                            // in the end it will take longer but allow to avoil possible ramming\rate-limiting from AWS
+            // in the end it will take longer but allow to avoil possible ramming\rate-limiting from AWS
+            self.api_timeout_max_ms += (2 as u128).pow(self.failed_attempts as u32) * 50; // AWS recommended way
+            // if we're there, we should set should_retry
+            self.should_retry = true;
         }
     }
 
-    fn is_stack_exists(&self, stack_name: &str) -> bool {
+    fn is_stack_exists(&mut self, stack_name: &str) -> bool {
         let input = DescribeStacksInput {
             stack_name: Some(stack_name.to_owned()),
             ..Default::default()
         };
-        self.client.describe_stacks(input).sync().is_ok()
+        self.client
+            .describe_stacks(input)
+            .sync()
+            .map_err(|e| self.handle_api_error(e))
+            .is_ok()
+    }
+
+    fn handle_api_error<T>(&mut self, e: rusoto_core::RusotoError<T>)
+    where
+        T: Error,
+    {
+        match e {
+            rusoto_core::RusotoError::Unknown(ref cause) => {
+                if cause.status == 403 {
+                    // Mostly caused by credentials in my testing, somehow didn't end up in Credentials variant of enum
+                    debug!(
+                        "Error calling AWS API!\nStatus code: {}\nBody: {}\nHeaders: {:#?}",
+                        cause.status,
+                        cause.body_as_str(),
+                        cause.headers
+                    );
+                    error!("Error calling AWS API! Got 403 Forbidden! Check your credentials!");
+                    std::process::exit(2);
+                } else {
+                    warn!(
+                        "Error calling AWS API!\nStatus code: {}\nBody: {}\nHeaders: {:#?}",
+                        cause.status,
+                        cause.body_as_str(),
+                        cause.headers
+                    );
+                    self.handle_retry();
+                }
+            }
+            rusoto_core::RusotoError::Credentials(ref error) => {
+                error!("Error with provided credentials! {}", error.description());
+                std::process::exit(2);
+            }
+            _ => {
+                warn!("Error calling AWS API! {:#?} Retrying...", e);
+                self.handle_retry();
+            }
+        };
+    }
+
+    fn get_wait_time(&self) -> u64 {
+        let last_api_call_sec = self.last_api_call.elapsed().as_millis();
+        let wait_time = if last_api_call_sec < self.api_timeout_max_ms && !self.should_retry {
+            cmp::max(100, self.api_timeout_max_ms - last_api_call_sec)
+        } else {
+            self.api_timeout_max_ms
+        };
+        
+        // https://github.com/rust-lang/rust/issues/58580
+        wait_time as u64
     }
 
     fn print_events(&mut self, stack_name: &str) {
@@ -371,6 +444,7 @@ impl CFDescriber {
             error!("Stack with name {} doesn't exist!", stack_name);
             std::process::exit(1);
         }
+        // should always peek at last events for stack, even if there's no ongoing operations
         while self.should_keep_tailing(stack_name) || self.first_call {
             self.first_call = false;
             match self.get_recent_events(stack_name) {
@@ -378,42 +452,13 @@ impl CFDescriber {
                     for event in evts.iter() {
                         println!("{}", event);
                     }
+                    // succesfully printed events: reset flag
+                    self.should_retry = false;
                 }
-                Err(e) => {
-                    match e {
-                        rusoto_core::RusotoError::Unknown(ref cause) => {
-                            if cause.status == 403 {
-                                // Mostly caused by credentials in my testing, somehow didn't end up in Credentials variant of enum
-                                debug!("Error calling get_recent_events!\nStatus code: {}\nBody: {}\nHeaders: {:#?}",
-                                    cause.status, cause.body_as_str(), cause.headers);
-                                error!("Error calling get_recent_events! Got 403 Forbidden! Check your credentials!");
-                                std::process::exit(2);
-                            } else {
-                                error!("Error calling get_recent_events!\nStatus code: {}\nBody: {}\nHeaders: {:#?}",
-                                    cause.status, cause.body_as_str(), cause.headers);
-                                self.handle_retry();
-                            }
-                        }
-                        rusoto_core::RusotoError::Credentials(ref error) => {
-                            error!("Error with provided credentials! {}", error.description());
-                            std::process::exit(2);
-                        }
-                        _ => {
-                            error!("Error calling get_recent_events! {:#?} Retrying...", e);
-                            self.handle_retry();
-                        }
-                    };
-                }
+                Err(e) => self.handle_api_error(e),
             };
 
-            let last_api_call_sec = self.last_api_call.elapsed().as_millis();
-            let wait_time = if last_api_call_sec < self.api_timeout_max_ms {
-                cmp::max(100, self.api_timeout_max_ms - last_api_call_sec)
-            } else {
-                self.api_timeout_max_ms
-            };
-
-            use std::thread;
+            let wait_time = self.get_wait_time();
             thread::sleep(Duration::from_millis(wait_time as u64));
         }
     }
