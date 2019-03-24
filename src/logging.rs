@@ -34,13 +34,20 @@ pub(crate) fn setup_logger(config: &Config) -> Result<(), fern::InitError> {
                 message
             ))
         })
-        .level(default_level)
-        .level_for("tail-stack-events", self_level)
-        .chain(std::io::stdout())
         .chain(
             fern::Dispatch::new()
+            .level(default_level)
+            .level_for("tail-stack-events", self_level)
+            .chain(std::io::stdout())
+        )
+        // .level(default_level)
+        // .level_for("tail-stack-events", self_level)
+        
+        .chain(
+            fern::Dispatch::new()
+                .level_for("tail-stack-events", file_level)
+                .level(file_level)
                 .chain(fern::log_file("output.log")?)
-                .level(file_level),
         )
         .apply()?;
     Ok(())

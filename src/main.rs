@@ -5,6 +5,10 @@ extern crate log;
 use std::default::Default;
 mod credentials;
 mod logging;
+#[macro_use]
+extern crate clap;
+mod arg_parse;
+use arg_parse::{get_config_from_args, Config};
 use colored::*;
 use credentials::setup_aws_creds;
 use logging::setup_logger;
@@ -18,15 +22,12 @@ extern crate regex;
 use regex::Regex;
 use std::cmp;
 
-#[macro_use]
-extern crate clap;
-use clap::{App, Arg};
 // ======== aws ========
 extern crate rusoto_core;
 extern crate rusoto_ec2;
 extern crate rusoto_sts;
 
-use rusoto_core::{HttpClient, Region};
+use rusoto_core::HttpClient;
 
 use rusoto_cloudformation::{
     CloudFormation, CloudFormationClient, DescribeStackEventsError, DescribeStackEventsInput,
@@ -34,140 +35,9 @@ use rusoto_cloudformation::{
 };
 // ========== end of aws ======
 use std::error::Error;
-use std::str::FromStr;
 use std::thread;
 
 const MAX_TRIES: u8 = 10;
-
-struct Config {
-    region: Region,
-    stack_name: String,
-    debug: u8,
-    role_name: Option<String>,
-    profile_name: Option<String>,
-    follow: bool,
-    num_events: u8,
-    timeout: u128,
-}
-
-fn get_config_from_args() -> Result<Config, String> {
-    let matches = App::new("tail-stack-events")
-        .version(crate_version!())
-        .about("Tails CloudFormation stack events")
-        .arg(
-            Arg::with_name("region")
-                .short("r")
-                .long("region")
-                .value_name("REGION")
-                .help("Sets a region to use")
-                .takes_value(true)
-                .required(true),
-        )
-        .arg(
-            Arg::with_name("stack")
-                .help("Sets a stack name to watch for")
-                .takes_value(true)
-                .required(true),
-        )
-        .arg(
-            Arg::with_name("debug")
-                .short("d")
-                .multiple(true)
-                .help("Turn debugging logging on. Multiple occurences enable console debug. First one will write to separate logfile"),
-        )
-        .arg(
-            Arg::with_name("role_arn")
-                .long("role_arn")
-                .value_name("ASSUME_ROLE_ARN")
-                .help("Sets an ARN for assume-role to use")
-                .takes_value(true),
-        )
-        .arg(
-            Arg::with_name("profile")
-                .short("p")
-                .long("profile")
-                .takes_value(true)
-                .help("Sets an AWS-cli profile from ~/.aws/config")
-                .value_name("AWS_PROFILE"),
-        ).
-        arg(
-            Arg::with_name("follow")
-            .short("f")
-            .multiple(false)
-            .takes_value(false)
-            .help("Follow stack events till success\\failure of the whole stack")
-        ).
-        arg(
-            Arg::with_name("num_events")
-            .help("Number of events to pull in one go (max: 100)")
-            .value_name("NUMBER_OF_EVENTS")
-            .default_value("10")
-            .takes_value(true)
-            .short("n")
-        )
-        .arg(
-            Arg::with_name("timeout")
-            .short("t")
-            .help("Number of seconds to wait between subsequental calls")
-            .default_value("10")
-            .takes_value(true)
-            .value_name("TIMEOUT")
-        )
-        .get_matches();
-    let region;
-    let debug;
-    let stack_name;
-    let role_name;
-    let profile_name;
-    let follow;
-    let num_events: u8;
-    let timeout: u128;
-
-    if matches.is_present("region") {
-        region = Region::from_str(matches.value_of("region").unwrap())
-            .map_err(|e| format!("{:#?}", e))?;
-    } else {
-        return Err("no region name was given".to_owned());
-    };
-
-    if matches.is_present("stack") {
-        stack_name = matches.value_of("stack").unwrap().to_owned();
-    } else {
-        return Err("no stack name was given".to_owned());
-    };
-    if matches.is_present("role_arn") {
-        role_name = Some(matches.value_of("role_arn").unwrap().to_owned());
-    } else {
-        role_name = None
-    };
-
-    if matches.is_present("profile") {
-        profile_name = Some(matches.value_of("profile").unwrap().to_owned());
-    } else {
-        profile_name = None
-    };
-
-    debug = matches.occurrences_of("debug") as u8;
-    follow = matches.is_present("follow");
-    num_events = cmp::min(100, value_t!(matches, "num_events", u8).unwrap_or(10));
-
-    // from cmd-args we got seconds, but internally we use ms
-    timeout = cmp::max(
-        1000,
-        value_t!(matches, "timeout", u128).unwrap_or(10) * 1000,
-    );
-
-    Ok(Config {
-        region,
-        stack_name,
-        debug,
-        role_name,
-        profile_name,
-        follow,
-        num_events,
-        timeout,
-    })
-}
 
 struct CFDescriber {
     last_event: Option<StackEvent>,
@@ -373,7 +243,7 @@ impl CFDescriber {
             self.failed_attempts += 1;
             // in the end it will take longer but allow to avoil possible ramming\rate-limiting from AWS
             self.api_timeout_max_ms += (2 as u128).pow(self.failed_attempts as u32) * 50; // AWS recommended way
-            // if we're there, we should set should_retry
+                                                                                          // if we're there, we should set should_retry
             self.should_retry = true;
         }
     }
@@ -434,7 +304,13 @@ impl CFDescriber {
         } else {
             self.api_timeout_max_ms
         };
-        
+
+        debug!("wait time: {}, last_api_call(ms): {}, max_timeout(ms): {}, should_retry: {}", 
+            wait_time,
+            last_api_call_sec,
+            self.api_timeout_max_ms,
+            self.should_retry
+            );
         // https://github.com/rust-lang/rust/issues/58580
         wait_time as u64
     }
