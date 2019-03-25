@@ -99,8 +99,8 @@ impl std::fmt::Display for CFStackEvent {
 
         f.write_fmt(format_args!(
             "{:<15.15} {:<25.25} {:<35.35} {:<25.25} {:<50}",
-            date.format("%d %b %H:%M:%S"),
-            logical_resource_id.bold(),
+            date.format("%b %d %H:%M:%S"),
+            logical_resource_id.bold().yellow(),
             resource_type.replace("AWS::", "").cyan(),
             msg,
             resource_status_reason

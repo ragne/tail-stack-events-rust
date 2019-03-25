@@ -112,7 +112,6 @@ pub(crate) fn get_config_from_args() -> Result<Config, String> {
     };
 
     debug = matches.occurrences_of("debug") as u8;
-    println!("debug: {}", debug);
     follow = matches.is_present("follow");
     num_events = cmp::min(100, value_t!(matches, "num_events", u8).unwrap_or(10));
 
