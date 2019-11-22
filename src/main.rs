@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 extern crate chrono;
 use chrono::NaiveDateTime;
 use std::ops::Deref;
+use std::str::FromStr;
 extern crate regex;
 use regex::Regex;
 use std::cmp;
@@ -31,7 +32,7 @@ use rusoto_core::HttpClient;
 
 use rusoto_cloudformation::{
     CloudFormation, CloudFormationClient, DescribeStackEventsError, DescribeStackEventsInput,
-    DescribeStacksInput, StackEvent,
+    DescribeStacksInput, StackEvent, DescribeStackResourcesInput, ListStackResourcesInput
 };
 // ========== end of aws ======
 use std::error::Error;
@@ -51,6 +52,7 @@ struct CFDescriber {
     // todo: get rid of me
     first_call: bool,
     should_retry: bool,
+    nested_stacks: Vec<String>
 }
 
 struct CFStackEvent {
@@ -122,6 +124,11 @@ impl From<StackEvent> for CFStackEvent {
     }
 }
 
+fn stack_name_from_arn(arn: &str) -> String {
+    // arn:aws:cloudformation:eu-west-1:095791294995:stack/devops-9844-Access-KCAWVFDJGRM6/fd2c27d0-0c5e-11ea-9358-0aa24a1523d0
+    String::from_str(arn.split_terminator('/').nth(1).expect("should always have 1st element")).unwrap() // infallible conversion
+}
+
 impl CFDescriber {
     fn new(config: &Config) -> Self {
         let provider = setup_aws_creds(
@@ -144,7 +151,36 @@ impl CFDescriber {
             // todo: figure out
             first_call: true,
             should_retry: false,
+            nested_stacks: Vec::new()
         }
+    }
+
+    fn update_nested_stacks(&mut self, stack_name: String) {
+        let mut stack_names = Vec::new();
+        let mut next_token: Option<String> = None;
+        loop {
+            let stack_resource_request = ListStackResourcesInput {
+                stack_name: stack_name.clone(),
+                next_token
+            };
+            let response = self.client.list_stack_resources(stack_resource_request)
+                .sync().expect("cannot unwrap a result");
+            
+            stack_names.extend(
+                response.stack_resource_summaries.expect("cannot get stack_resources")
+        .iter_mut().filter(|resource| resource.resource_type == "AWS::CloudFormation::Stack")
+        .map(|resource| stack_name_from_arn(resource.physical_resource_id.as_ref().expect("there is no physresid")))
+            );
+
+            if let Some(tkn) = response.next_token {
+                next_token = Some(tkn)
+            } else {
+                break
+            }
+        }
+
+        warn!("nested: {:?} / {}", stack_names, stack_names.len());
+        self.nested_stacks.extend(stack_names);
     }
 
     fn get_recent_events(
@@ -155,6 +191,8 @@ impl CFDescriber {
             stack_name: Some(stack_name.to_owned()),
             ..Default::default()
         };
+
+        self.update_nested_stacks(stack_name.to_owned());
 
         self.last_api_call = Instant::now();
         let evts = self.client.describe_stack_events(cf_desc_input);
@@ -320,6 +358,7 @@ impl CFDescriber {
             error!("Stack with name {} doesn't exist!", stack_name);
             std::process::exit(1);
         }
+        
         // should always peek at last events for stack, even if there's no ongoing operations
         while self.should_keep_tailing(stack_name) || self.first_call {
             self.first_call = false;
@@ -341,7 +380,9 @@ impl CFDescriber {
 }
 
 fn main() -> Result<(), String> {
-    setup_panic!();
+    if !cfg!(debug_assertions) {
+        setup_panic!();
+    }
     let config = get_config_from_args()?;
 
     setup_logger(&config).expect("Cannot setup logger. Shouldn't be possible in most cases");
@@ -349,4 +390,18 @@ fn main() -> Result<(), String> {
     let mut cf = CFDescriber::new(&config);
     cf.print_events(&config.stack_name);
     Ok(())
+}
+
+
+#[cfg(test)]
+pub mod tests {
+    use super::stack_name_from_arn;
+
+    #[test]
+    fn test_arn() {
+        assert_eq!(
+            stack_name_from_arn("arn:aws:cloudformation:eu-west-1:095791294995:stack/devops-9844-Access-KCAWVFDJGRM6/fd2c27d0-0c5e-11ea-9358-0aa24a1523d0"),
+            "devops-9844-Access-KCAWVFDJGRM6"
+        )
+    }
 }
